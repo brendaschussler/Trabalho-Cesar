@@ -1,0 +1,782 @@
+;**************************************************************************************************************************************************
+;	
+;	ALUNA:BRENDA SCHUSSLER
+;
+;**************************************************************************************************************************************************;*************************************************************************************************************************************************
+;
+;	Arquivo de Referência para o desenvolvimento do kernel
+;
+;	Versão: 2021.1
+;
+;	Áreas de memória
+;
+;	0000 - 7FFF		_KERNEL
+;					Área de Kernel para implementação dos alunos
+;
+;	0100 - 01FF		_VETTAB
+;					Tabela com os vetores das funções do kernel
+;					*** CUIDADO! Esse vetor está no meio da área de código ***
+;
+;	8000 - FF7F		_APP
+;					Área onde será colocado o programa de aplicação.
+;					Esse programa vai fazer o acesso aos periféricos e interrupções, através das funções do Kernel.
+;
+;	FF80 - FFBF 		_IOAREA16
+;					Area de perifericos, acessada na base 16 bits
+;
+;	FFC0 - FFFF		_IOAREA08
+;					Area de perifericos, acessada na base 8 bits
+;					
+;**************************************************************************************************************************************************
+
+_KERNEL:	equ	h0000		;endereço de onde começa o kernel
+_VETTAB:	equ	h0100		;endereço onde começa os vetores	
+_APP:		equ	h8000		;endereço onde começa a aplicação 	
+_IOAREA16:	equ	hFF80		;onde começa a área de periféricos de acesso em 2 bytes (como memoria)
+_IOAREA08:	equ	hFFC0		;onde começam os periféricos de acesso byte a byte
+
+;
+;------------------------------------------------------------------------------
+;	Área reservada para os periféricos
+;------------------------------------------------------------------------------
+
+; Acesso em 16 bits - 2 bytes
+
+		org		_IOAREA16
+
+		daw		[31]
+IVET:	dw		0			; Vetor de interrupção
+
+; Acesso em 8 bits - byte a byte
+
+		org		_IOAREA08
+
+		dab		[23]
+TIMDT:	db		0			; Registro de programação do timer
+INTS:	db		0			; INTERRUPT STATUS: IP x x x . x x IPStec IPStim
+INTE:	db		0			; INTERRUPT ENABLE: IE x x x . x x IEStec IEStim
+TECST:	db		0			; Status do teclado
+TECDT:	db		0			; Dado do teclado
+VISOR:	dab	        [36]			; Portas de acesso ao visor [ 0-21(texto) 22-28(relógio 0) 29-35(relógio 1)]
+
+;	
+;------------------------------------------------------------------------------
+;	Ponto de entrada do RESET do processador
+;------------------------------------------------------------------------------
+		org		_KERNEL 	;org h0000 - inicio do Kernel 
+
+		jmp		_RESET		;o kernel começa com a função reset e em seguida pula para a aplicação que chamará o kernel 
+
+;
+;------------------------------------------------------------------------------
+;	Area do kernel com os vetores das funções do kernel
+; através destes vetores a aplicação chama as funções (são como ponteiros)
+;------------------------------------------------------------------------------
+		org		_VETTAB		;org h0100
+
+		dw		_kbhit
+		dw		_getchar
+		dw		_putchar
+		dw		_get_clock_status
+		dw		_get_clock_time
+		dw		_turnon_clock
+		dw		_clr_clock
+		
+;	
+;-----------------------------------------------------------------------------------------------------------------------------------
+;	Código de RESET (BOOT) do processador/interrupção
+;;-----------------------------------------------------------------------------------------------------------------------------------
+		org		_VETTAB+h0100
+_RESET:		
+; 1) Desabilitar o sistema de interrupções
+
+		CLR 	INTE 						;INTE = (00000000)
+
+; 2) Inicializar o stack pointer (SP = R6)
+
+		MOV 	#H7FFF, R6					;pilha começa no ultimo endereço antes da aplicação para ter o maior espaço possível
+
+; 3) Inicializar as variáveis internas usadas pelo sistema de interrupções e periféricos (IVET, INTE, etc.)
+
+		MOV 	#ISR, IVET					;ISR é onde começa a interrupção
+		CLR 	INTS
+		CLR 	INTE
+
+; 4) Inicializar as variáveis internas do kernel
+
+		MOV	#VISOR, Posicao		;Posicao = VISOR
+		MOV	#'_', Cursor
+		MOV	#H30, PosRel00		;Inicia com ASCII de zero
+		MOV	#H30, PosRel01
+		MOV	#H30, PosRel02
+		MOV	#H30, PosRel03
+		MOV	#H30, PosRel10
+		MOV	#H30, PosRel11
+		MOV	#H30, PosRel12
+		MOV	#H30, PosRel13
+		CLR	Teclado
+		CLR	KbhitAtiva
+		CLR 	GetCharAtivo
+		CLR	PosNoVisor
+		CLR	TeclaNoCursor
+		CLR	AndandoRel0
+		CLR	AndandoRel1
+		CLR	ContTimer
+		CLR	ContPiscadas
+		CLR	PiscadaAtiva
+		CLR	ContSegTotal0
+		CLR	ContSegTotal1
+		CLR	ContIntTotal0
+		CLR	ContIntTotal1
+		CLR	ContUSeg0
+		CLR	ContDSeg0
+		CLR	ContUMin0
+		CLR	ContDMin0
+		CLR	ContUSeg1
+		CLR	ContDSeg1
+		CLR	ContUMin1
+		CLR	ContDMin1
+		CLR	PrintaRel0
+		CLR	PrintaRel1
+
+; 5) Inicializar o teclado zerando o byte de estado (TECST, endereço 65498)
+
+		CLR 	TECST
+
+; 6) Inicializar o timer
+
+		MOV 	#100, TIMDT		;100 ms
+
+; 7) Limpar o visor
+
+		MOV 	#65500, R2
+LoopLimpa:	MOV	#' ',(R2)
+		INC	R2
+		BNE     LoopLimpa
+
+; 8) Habilitar interrupções
+
+		MOV #131, INTE					;INTE = (10000000)
+
+; 9) Retornar para o programa de aplicação com um desvio para o endereço _APP da memória
+
+		JMP		_APP
+
+;		
+;-----------------------------------------------------------------------------------------------------------------------------------
+; Função através da qual pode-se solicitar ao kernel a informação sobre a existência de tecla digitada.
+; A função deve retornar com a informação da existência de tecla, sem aguardar pela digitação de qualquer tecla. 
+; - Parâmetros de entrada: nenhum. 
+; - Parâmetro de saída: registrador R0, com a informação da existência de tecla. 
+; A função retorna no registrador R0 a informação se existe tecla ou não. 
+; - Se há tecla, o valor em R0 será zero; 
+; - Se não há tecla, o valor em R0 será um valor qualquer diferente de zero. 
+;-----------------------------------------------------------------------------------------------------------------------------------
+_kbhit:
+		MOV 		#1, R0		;se não ha tecla, R0 recebe 1					
+		CMP		Teclado, #0	;Verifica se a variável de teclado está vazia
+		BEQ		NaoHaTecla	;se o flag Z ativado desvia 
+		CLR		R0      	;se há tecla, não desviou, R0 recebe 0 
+NaoHaTecla:
+		RTS		R7
+				
+;		
+;-----------------------------------------------------------------------------------------------------------------------------------
+; Função através da qual pode-se solicitar ao kernel que aguarde pela digitação de uma tecla.
+; A função deve retornar o código ASCII da tecla digitada.
+; Portanto, a função deve aguardar pela digitação de uma tecla. 
+; - Parâmetros de entrada: nenhum. 
+; - Parâmetro de saída: registrador R0, com a tecla digitada. 
+; A função só retorna (só termina) quando o usuário digitar alguma tecla.
+; O código ASCII da tecla digitada deve ser retornado no registrador R0. 
+; Sempre que a função “_getchar” for chamada e estiver bloqueada aguardando por uma tecla,
+;     a posição do cursor deve ser apresentado no visor através do símbolo “_” (underscore).
+; Esse símbolo deve ser alternado com o caractere que estiver sendo apresentado nessa posição.
+; Essa alternância deve ter uma periodicidade tal que cada símbolo permaneça no visor por 500ms. 
+;-----------------------------------------------------------------------------------------------------------------------------------
+_getchar:
+		MOV	Posicao, R1
+		MOV	(R1), TeclaNoCursor	;Movo o conteudo de posicai para TeclaNoCursor (variavel utilizada para não haver perda de teclas)
+		
+		MOV	#1, KbhitAtiva		;Indica que a Kbhit está ativa enquanto espera a digitação de uma tecla
+LoopKbhit:	JSR	R7, _kbhit		;Chama a funçao Kbhit
+		TST	R0			;Testa o valor em R0 (retornado pela Kbhit indica se há tecla digitada ou nao)
+		BNE	LoopKbhit		;Enquanto não há tecla digitada repete a funçao 
+		CLR	KbhitAtiva		;Houve tecla digitada, Kbhit nao esta mais ativa
+		MOV	Posicao, R3	
+		MOV	TeclaNoCursor, (R3)	;Movo a tecla anteriormente salva para posicao
+
+		MOV	Teclado, R0 		;Movo o teclado para R0 (teclado contém o ASCII da tecla digitada pelo usuário)
+		CLR	Teclado			;Limpo a variavel teclado, indicando que não ha mais tecla 
+
+		RTS	R7
+;		
+;-----------------------------------------------------------------------------------------------------------------------------------
+; Envia um caractere ASCII para o visor.
+; Esse caractere pode ser um caractere visível ou um caractere de controle. 
+; - Parâmetros de entrada: registrador R5, com o caractere a ser colocado no visor. 
+; - Parâmetro de saída: registrador R0, com o código de erro de retorno. 
+; O código no registrador R5 pode representar caracteres visíveis ou caracteres de controle. 
+; Na inicialização do kernel, o visor deve ser limpo (apagado) e o cursor deve ser posicionado no início do visor. 
+; A função retorna no registrador R0 um código de erro. 
+; - Se não houve erro, o valor em R0 será zero; 
+; - Se houve algum erro ou informação inválida de entrada, o valor em R0 será um valor qualquer diferente de zero. 
+;-----------------------------------------------------------------------------------------------------------------------------------
+_putchar:
+		CMP	R5, #H0D		;Verifica se o caracter em R5 é o carriage return
+		BEQ	CarriageReturn		;se for, executa a função carriage return
+		JMP	TestaBackspace		;se não, pula para testar se é um backspace
+
+CarriageReturn: 				;Carriage Return: move o cursor para a primeira posição mais a esquerda do visor
+		MOV	#VISOR, Posicao		;coloca a primeira posicao do visor em posicao
+		CLR	PosNoVisor		;limpa variavel auxiliar contadora de caracteres colocados
+		JMP	FimPutChar		;pula para o fim
+
+TestaBackspace: CMP	R5, #H08		;verifica se o caractere em R5 é o backspace
+		BEQ	BackSpace		;se foi back space: move o cursor uma posição para a esquerda. Caso o cursor esteja no início do visor, esse caractere deve ser ignorado
+		JMP	CaracVis		;Se não foi nenhum desses caracteres, é um caractere visivel
+BackSpace:	CMP	#VISOR, Posicao		;foi backspace: compara se o cursor esta no inicio do visor
+		BEQ	FazerNada		;se está, ignora o backspace
+		DEC	Posicao			;se não, decrementa posicao (move o cursor uma posicao para esquerda)
+		DEC	PosNoVisor		;decrementa o auxiliar
+		JMP	FimPutChar		;pula para o fim
+		
+FazerNada:	JMP	FimPutChar		;pula para o fim
+
+
+CaracVis:	TST	R5			;se foi um caractere visivel: 
+		BEQ	FimPutChar
+		
+		CMP	R5,#' '			;verifica se o caractere esta dentre os validos (r0>=' ' && r0<='z')
+		BLT	ErroPutChar		;se não estiver retorna erro
+		CMP	R5,#'z'
+		BGT	ErroPutChar
+	
+		MOV	Posicao, R1		;se foi um caractere valido 
+PutChar:	MOV	R5, (R1)		;move o caractere para posicao no visor
+		CMP	PosNoVisor, #21		;verifica se ja encheu o visor
+		BEQ	FimPutChar		;se encheu, fim 
+		INC	R1			;se nao, incrementa posicao
+		MOV	R1, Posicao
+		INC	PosNoVisor		;incrementa auxiliar
+		
+		CLR	R0			;não houve erro, R0=0
+		JMP	FimPutChar
+		
+ErroPutChar:	MOV	#1, R0			;se houve erro, R0 diferente de 0
+
+FimPutChar:	RTS	R7
+
+		
+;		
+;----------------------------------------------------------------------------------------------------------------------------------
+; Essa função fornece as informações relativas à situação atual de cada relógio, 
+; no que diz respeito à sua visibilidade e se está andando. 
+; - Parâmetros de entrada: registrador R5, com o identificador do relógio a ser lido.
+;   Esse valor pode ser 0 (zero) ou 1 (um). 
+; Outros valores devem ser ignorados. 
+; - Parâmetro de saída: registrador R0, com a indicação do estado do relógio (visibilidade e se está parado). 
+; No retorno da função, o registrador R0 conterá as informações do estado do relógio em seus bits 0 e bit 1. 
+; O bit 0, quando ligado (valor “1”), indica que o relógio está visível;
+; O bit 1, quando ligado (valor “1”), indica que o relógio está andando. 
+;
+; 00 = parado e não visível (0)
+; 01 = parado e visível (1)
+; 10 = andando e não visível (2)
+; 11 = andando e visível (3)
+;-----------------------------------------------------------------------------------------------------------------------------------
+_get_clock_status:
+
+			CMP		R5, #0		;se R5 contem 0 é o relogio 0
+			BEQ		StatusClock0
+			CMP		R5, #1		;se R5 contem 1 é o relogio 1
+			BEQ		StatusClock1		
+			JMP		FimStatusClock  ;valor diferente de 0 ou 1, é ignorado
+
+;---------------------------------------
+StatusClock0:   	TST		AndandoRel0		;verifica se o relogio 0 esta andando
+			BEQ		Parado0			;se for 0 está parado
+			JMP		Andando0 		;se nao, esta andando
+
+Parado0: 		TST		PrintaRel0		;esta parado, testa se esta printado o relogio 
+			BEQ		ParadoInvisivel0	;se nao, esta parado e invisivel
+			MOV		#1, R0			;se nao, esta parado e visível = 01 = 1
+			JMP		FimStatusClock
+
+Andando0:		TST		PrintaRel0		;esta anando, testa se esta printado
+			BEQ		AndandoInvisivel0	;se nao, esta andando e invisivel
+			MOV		#3, R0			;se nao, esta andando e visível = 11 = 3
+			JMP		FimStatusClock		
+	
+ParadoInvisivel0: 	MOV 		#0, R0   		;parado e invisivel, R0 recebe 00
+			JMP		FimStatusClock
+
+AndandoInvisivel0:	MOV		#2, R0			;andando e invisivel, R0 recebe 10 = 2 
+			JMP		FimStatusClock
+;---------------------------------------
+
+;---------------------------------------			;Repete a funçao anterior, agora para o relogio 1:
+StatusClock1:   	TST		AndandoRel1	
+			BEQ		Parado1			;se for 0 está parado
+			JMP		Andando1 
+
+Parado1: 		TST		PrintaRel1
+			BEQ		ParadoInvisivel1
+			MOV		#1, R0			;parado e visível = 01 = 1
+			JMP		FimStatusClock
+
+Andando1:		TST		PrintaRel1
+			BEQ		AndandoInvisivel1
+			MOV		#3, R0			;andando e visível = 11 = 3
+			JMP		FimStatusClock		
+	
+ParadoInvisivel1: 	MOV 		#0, R0   		;R0 recebe 00
+			JMP		FimStatusClock
+
+AndandoInvisivel1:	MOV		#2, R0			;R0 recebe 10 = 2 
+			JMP		FimStatusClock
+;---------------------------------------
+
+FimStatusClock:		RTS		R7
+	
+;		
+;-----------------------------------------------------------------------------------------------------------------------------------
+; Essa função fornece o valor atual de cada relógio.
+; Essa informação é fornecida como um número inteiro de segundos.
+; Como cada relógio tem minutos e segundos,
+;     o valor fornecido deverá ser o resultado da aplicação da seguinte fórula (60*MIN+SEG). 
+; - Parâmetros de entrada: registrador R5, com o identificador do relógio a ser lido.
+;   Esse valor pode ser 0 (zero) ou 1 (um). Outros valores devem ser ignorados. 
+; - Parâmetro de saída: registrador R0, com o número de segundos atualmente presentes no relógio. 
+; No retorno da função, o registrador R0 conterá o número de segundos correspondentes à informação atual no relógio.
+; Essa informação corresponde àquela presente no relógio, independentemente de seu estado (visível/invisível ou parado/andando). 
+;-----------------------------------------------------------------------------------------------------------------------------------
+_get_clock_time:
+		CMP	R5, #0			;Verifica se é o relogio 0
+		BEQ	GetClock0		;mostra segundos do relogio 0
+		CMP     R5, #1			;Verifica se é o relogio 1
+		BEQ	GetClock1		;mostra segundos do relogio 1
+		JMP	FimGetClock		;outros valores são ignorados
+
+GetClock0:	MOV	ContSegTotal0, R0	;R0 recebe os segundos totais do relogio 0
+		JMP	FimGetClock
+
+GetClock1:	MOV	ContSegTotal1, R0	;R0 recebe os segundos totais do relogio 1
+		JMP	FimGetClock
+
+FimGetClock:	RTS	R7
+		
+;		
+;-----------------------------------------------------------------------------------------------------------------------------------
+; Essa função é usada para indicar ao kernel se o relógio deve “andar” ou “parar”.  
+; - Parâmetros de entrada: 
+;   - registrador R5, com o identificador do relógio a ser ativado/desativado.
+;     Esse valor pode ser 0 (zero) ou 1 (um). Outros valores devem ser ignorados; 
+;   - registrador R4, com a indicação do estado a ser colocado o relógio.
+;     Esse valor pode ser 0 (zero), caso o relógio deva parar,
+;     ou um valor diferente de 0 (zero), caso o relógio deva andar. 
+; - Parâmetro de saída: registrador R0, com o código de erro de retorno. 
+; A função retorna no registrador R0 um código de erro. 
+; - Se não houve erro, o valor em R0 será zero; 
+; - Se houve algum erro ou informação inválida de entrada,
+;   o valor em R0 será um valor qualquer diferente de zero. 
+;-----------------------------------------------------------------------------------------------------------------------------------
+_turnon_clock:
+		CLR		R0
+		CMP		R5, #0			;Verifica se é o relogio 0
+		BEQ		TurnOn0			;anda/para relogio 0
+		CMP		R5, #1			;Verifica se é o relogio 1
+		BEQ		TurnOn1			;anda/para relogio 1
+		MOV		R5, R0			;valor diferente de 0 ou 1, é erro
+		JMP		FimTurnOnClock
+
+TurnOn0:	TST		R4			;anda/para relogio 0:
+		BEQ		TurnOff0		;R4 em 0 desliga o relogio
+		MOV		#1, AndandoRel0		;R4 diferente de 0 anda o relogio = Andando recebe 1
+		JMP		FimTurnOnClock 	
+TurnOff0:	CLR		AndandoRel0		;Andando recebe 0
+		JMP		FimTurnOnClock 	
+
+TurnOn1:	TST		R4			;anda/para relogio 1:
+		BEQ		TurnOff1		;R4 em 0 desliga o relogio
+		MOV		#1, AndandoRel1		;R4 diferente de 0 anda o relogio = Andando recebe 1
+		JMP		FimTurnOnClock 	
+TurnOff1:	CLR		AndandoRel1		;Andando recebe 0
+		JMP		FimTurnOnClock
+
+FimTurnOnClock: RTS		R7
+		
+;		
+;-----------------------------------------------------------------------------------------------------------------------------------
+; Essa função é usada para indicar ao kernel que o relógio deve ser zerado.
+; Ou seja, minutos e horas armazenado no relógio devem ser zerados. 
+; - Parâmetros de entrada: registrador R5, com o identificador do relógio a ser zerado.
+;   Esse valor pode ser 0 (zero) ou  1 (um). Outros valores devem ser ignorados; 
+; - Parâmetro de saída: registrador R0, com o código de erro de retorno. 
+; A função retorna no registrador R0 um código de erro. 
+; - Se não houve erro, o valor em R0 será zero; 
+; - Se houve algum erro ou informação inválida de entrada,
+;          o valor em R0 será um valor qualquer diferente de zero. 
+;-----------------------------------------------------------------------------------------------------------------------------------
+_clr_clock:
+		CLR		R0
+		CMP		R5, #0		;Testo R5 para ver qual relogio devo zerar
+		BEQ		ZerarRel0	;R5 em 0, zerar relogio 0
+		CMP		R5, #1
+		BEQ		ZerarRel1	;R5 em 1, zerar relogio 1
+		MOV		R5, R0		;valor diferente de 0 ou 1, é erro
+		JMP		FimClrClock
+
+ZerarRel0:	MOV		#H30, PosRel00	;ao mover h30 para as posições do relogio 0 no visor, movo o ASCII de zero (zero o relogio 0 no visor)
+		MOV		#H30, PosRel01
+		MOV		#H30, PosRel02
+		MOV		#H30, PosRel03
+		CLR		ContUSeg0	;Zero os contadores do relogio 0
+		CLR		ContDSeg0
+		CLR		ContUMin0
+		CLR		ContDMin0
+		CLR		ContSegTotal0
+		CLR		ContIntTotal0
+		JMP		FimClrClock
+
+ZerarRel1:	MOV		#H30, PosRel10	;ao mover h30 para as posições do relogio 1 no visor, movo o ASCII de zero (zero o relogio 1 no visor)
+		MOV		#H30, PosRel11
+		MOV		#H30, PosRel12
+		MOV		#H30, PosRel13	
+		CLR		ContUSeg1	;Zero os contadores do relogio 1
+		CLR		ContDSeg1
+		CLR		ContUMin1
+		CLR		ContDMin1
+		CLR		ContSegTotal1
+		CLR		ContIntTotal1
+		JMP		FimClrClock
+
+FimClrClock:	RTS		R7
+
+;-----------------------------------------------------------------------------------------------------------------------------------
+;-----------------------------------------------------------------------------------------------------------------------------------
+;-----------------------------------------------------------------------------------------------------------------------------------
+;-----------------------------------------------------------------------------------------------------------------------------------
+
+;TRATADOR DE INTERRUPÇÕES:
+
+ISR:
+		MOV		R0,-(R6)	; Salva registradores na pilha
+		MOV		R1,-(R6)
+		MOV		R2,-(R6)
+		MOV		R3,-(R6)
+		MOV		R4,-(R6)
+		MOV		R5,-(R6)
+
+		
+		MOV		INTS,R0		; Verifica se a interrupcao veio do teclado
+		AND		#2, R0		
+		BEQ		TesteTimer	; Não veio do teclado, pode ter vindo do timer
+ 		JSR		R7,ISRtec	; Se veio do teclado, tratamento da interrupcao do teclado
+		JMP		ISR2
+TesteTimer:	MOV		INTS, R0
+		AND		#1, R0
+		BEQ		ISRFim		;se não veio nem do teclado nem do timer, pula para fim 
+		JSR		R7, ISRtim	;se veio do timer, tratamento de interrupcao do timer
+		JMP		ISR3
+
+ISR2:		AND		#HFFFD,INTS	; Desliga bit de INT TECLADO
+		JMP		ISRFim
+
+ISR3: 		AND		#hFFFE,INTS	; Desliga bit de INT TIMER
+
+ISRFim:
+		MOV		(R6)+,R5	; Retorna os registradores da pilha
+		MOV		(R6)+,R4
+		MOV		(R6)+,R3
+		MOV		(R6)+,R2
+		MOV		(R6)+,R1
+		MOV		(R6)+,R0
+
+		RTI				; Return From Interrupt
+
+;------------------------------------------------------------------------------------------------------------------------------------
+
+; Tratamento das interrupções de teclado
+
+ISRtec:		JMP	TesteTeclaRel		;primeiro testa se foi uma tecla de ativação dos relogios
+FimTeste:
+		JMP	TeclaValida		;se não é uma tecla valida (a ser colocada no visor)
+
+FimISRtec:	CLR	TECST			;libera o TECST
+		RTS	R7			
+		
+				
+		;primeiro testa se foi uma tecla de ativação dos relogios
+TesteTeclaRel:	CMP	TECDT, #','		;Se a tecla for , não vai para R0
+		BEQ	NotPrintRel0
+		CMP	TECDT, #'<'		;Se a tecla for < não vai para R0
+		BEQ	NotPrintRel0
+		CMP	TECDT, #'.'		;Se a tecla for . não vai para R0
+		BEQ	NotPrintRel1
+		CMP	TECDT, #'>'		;Se a tecla for > não vai para R0
+		BEQ	NotPrintRel1
+		JMP	FimTeste
+
+NotPrintRel0:   CLR	Teclado			;Libera teclado
+		TST	PrintaRel0		;Se printa estava em 0
+		BEQ	Recebe01		;Vai receber 1
+		CLR     PrintaRel0		;Se não era 0, era 1, recebe 0
+		JMP	FimISRtec
+Recebe01:	MOV	#1, PrintaRel0		;Recebe 1
+		JMP	FimISRtec
+
+NotPrintRel1:   CLR	Teclado
+		TST	PrintaRel1		;Se printa estava em 0
+		BEQ	Recebe11		;Vai receber 1
+		CLR     PrintaRel1		;Se não era 0, era 1, recebe 0
+		JMP	FimISRtec
+Recebe11:	MOV	#1, PrintaRel1		;Recebe 1
+		JMP	FimISRtec
+
+
+TeclaValida: 	MOV	#Teclado, R1	;tecla valida é movida para a variavel teclado para ser colocada no visor				; 		
+		MOV	(R1), R0
+		AND	#HFF00,R0
+		OR	TECDT,R0
+		MOV	R0,Teclado
+
+		JMP	FimISRtec
+			
+
+;------------------------------------------------------------------------------------------------------------------------------------
+
+; Tratamento das interrupções de timer
+
+ISRtim:		CMP		#1, KbhitAtiva		;verifica se a kbhit esta ativa
+		BNE		FimISRtim
+		JSR		R7, PiscarCursor	;se esta ativa = modo edição de texto -> chama piscar cursor
+		JSR		R7, AndarRelogios	;anda os relogios adequadamente
+		CMP		PrintaRel0, #1
+		BEQ		Rel0Vis			;se o relogio esta visivel, printa relogio
+		JSR		R7, Rel0Invisivel
+		JMP		TstVisRel1
+Rel0Vis:	JSR		R7, PrintarRel0
+TstVisRel1:	CMP		PrintaRel1, #1
+		BEQ		Rel1Vis			;se o relogio esta visivel, printa relogio
+		JSR		R7, Rel1Invisivel
+		JMP		NenhumVis
+Rel1Vis:	JSR		R7, PrintarRel1
+NenhumVis:
+		
+
+FimISRtim:	RTS		R7
+			
+
+;-----------------------------------------------------------------------------------------------------------------------
+
+	
+AndarRelogios:
+		CMP	#1, AndandoRel0	;verifica se o relogio 0 esta andando
+		BEQ	IncConts0	;se esta, incrementa as constantes do rel0
+TestaAnda1:	CMP	#1, AndandoRel1	;verifica se o relogio 1 esta andando
+		BEQ	IncConts1	;se esta, incrementa as constantes do rel1
+FimTesteAnda:	JMP	FimAndarRel
+
+IncConts0:	INC	ContUSeg0	; A cada interrupcao (100ms), incrementa contadores de interrupcoes 0
+		INC	ContDSeg0
+		INC	ContUMin0
+		INC	ContDMin0
+		INC	ContIntTotal0
+		JMP	IncPosRel0
+
+IncConts1:	INC	ContUSeg1	; A cada interrupcao (100ms), incrementa contadores de interrupcoes 1
+		INC	ContDSeg1
+		INC	ContUMin1
+		INC	ContDMin1
+		INC	ContIntTotal1
+		JMP	IncPosRel1
+
+IncPosRel0:	CMP	ContIntTotal0, #10
+		BEQ	IncSegTot0
+		JMP	IncUseg0
+IncSegTot0:	INC	ContSegTotal0
+		CLR	ContIntTotal0
+
+IncUseg0:	CMP	ContUSeg0, #10		;Se passaram 10 interrupcoes, passou 1 segundo
+		BEQ	IncPosRel00
+		JMP 	TesteDseg
+IncPosRel00:	INC	PosRel00		;incrementa unidades de segundos 
+		CLR     ContUSeg0
+		CMP	PosRel00, #H3A
+		BNE	Prox00
+		MOV	#H30, PosRel00	
+Prox00:
+TesteDseg:	CMP	ContDSeg0, #100		;Se passaram 100 interrupcoes, passou 10 segundos
+		BEQ	IncPosRel01
+		JMP 	TesteUmin
+IncPosRel01:	INC	PosRel01		;incrementa dezena de segundos 
+		CMP	PosRel01, #H36
+		BEQ	ZeraDseg0
+		JMP	FimDseg0
+ZeraDseg0:	MOV	#H30, PosRel01
+FimDseg0:	CLR     ContDSeg0
+
+TesteUmin:	CMP	ContUMin0, #600		;Se passaram 600 interrupcoes, passou 60 segundos = 1 minuto
+		BEQ	IncPosRel02
+		JMP 	TesteDmin
+IncPosRel02:	INC	PosRel02		;incrementa unidades de minutos 
+		CLR     ContUMin0
+		CMP	PosRel02, #H3A
+		BNE	Prox02
+		MOV	#H30, PosRel02
+Prox02:
+TesteDmin:	CMP	ContDMin0, #6000	;Se passaram 6000 interrupcoes, passou 600 segundos = 10 minutos
+		BEQ	IncPosRel03
+		JMP 	TestaAnda1
+IncPosRel03:	INC	PosRel03		;incrementa dezena de minutos 
+		CLR     ContDMin0
+		JMP 	TestaAnda1
+
+
+;---------------------------------------
+
+IncPosRel1:	CMP	ContIntTotal1, #10
+		BEQ	IncSegTot1
+		JMP	IncUseg1
+IncSegTot1:	INC	ContSegTotal1
+		CLR	ContIntTotal1
+
+IncUseg1:	CMP	ContUSeg1, #10		;Se passaram 10 interrupcoes, passou 1 segundo
+		BEQ	IncPosRel10
+		JMP 	TesteDseg1
+IncPosRel10:	INC	PosRel10		;incrementa unidades de segundos 
+		CLR     ContUSeg1
+		CMP	PosRel10, #H3A
+		BNE	Prox10
+		MOV	#H30, PosRel10	
+Prox10:
+TesteDseg1:	CMP	ContDSeg1, #100		;Se passaram 100 interrupcoes, passou 10 segundos
+		BEQ	IncPosRel11
+		JMP 	TesteUmin1
+IncPosRel11:	INC	PosRel11		;incrementa dezena de segundos 
+		CMP	PosRel11, #H36
+		BEQ	ZeraDseg1
+		JMP	FimDseg1
+ZeraDseg1:	MOV	#H30, PosRel11
+FimDseg1:	CLR     ContDSeg1
+
+TesteUmin1:	CMP	ContUMin1, #600		;Se passaram 600 interrupcoes, passou 60 segundos = 1 minuto
+		BEQ	IncPosRel12
+		JMP 	TesteDmin1
+IncPosRel12:	INC	PosRel12		;incrementa unidades de minutos 
+		CLR     ContUMin1
+		CMP	PosRel12, #H3A
+		BNE	Prox12
+		MOV	#H30, PosRel12
+Prox12:
+TesteDmin1:	CMP	ContDMin1, #6000	;Se passaram 6000 interrupcoes, passou 600 segundos = 10 minutos
+		BEQ	IncPosRel13
+		JMP 	FimTesteAnda
+IncPosRel13:	INC	PosRel13		;incrementa dezena de minutos 
+		CLR     ContDMin1
+		
+FimAndarRel:	RTS	R7
+
+
+
+;-----------------------------------------------------------------------------------------------------------------------
+
+Rel0Invisivel:					;relogio invisivel: movo espaços para o visor
+
+		MOV	#' ', 65528
+		MOV	#' ', 65527
+		MOV	#' ', 65526
+		MOV	#' ', 65525
+		MOV	#' ', 65524
+		RTS	R7
+		
+PrintarRel0:	MOV	PosRel00, 65528		;relogio visivel, movo o ASCII do numero atual para as posições do visor
+		MOV	PosRel01, 65527
+		MOV	#':', 65526
+		MOV	PosRel02, 65525
+		MOV	PosRel03, 65524
+		RTS	R7
+
+;--------------------------------------------
+;--------------------------------------------
+
+Rel1Invisivel:					;relogio invisivel: movo espaços para o visor
+
+		MOV	#' ', 65535
+		MOV	#' ', 65534
+		MOV	#' ', 65533
+		MOV	#' ', 65532
+		MOV	#' ', 65531
+		RTS	R7
+
+
+PrintarRel1:	MOV	PosRel10, 65535		;relogio visivel, movo o ASCII do numero atual para as posições do visor
+		MOV	PosRel11, 65534
+		MOV	#':', 65533
+		MOV	PosRel12, 65532
+		MOV	PosRel13, 65531	
+		RTS	R7
+
+;----------------------------------------------------------------------------------------------------
+;----------------------------------------------------------------------------------------------------
+
+PiscarCursor:					;funçao para piscar o cursor
+		INC	ContPiscadas
+		CMP	ContPiscadas, #5	;quando contador chega em 5, passaram 500ms = hora de piscar
+		BEQ	Pisca			;pisca
+		JMP	FimPiscar
+
+Pisca:		CLR	ContPiscadas		;limpa o contador
+		TST	PiscadaAtiva		;indica ser hora de mudar o que esta aparecendo
+		BEQ	NotPisca1		;inverte o que estava (pisca = hora _ hora caractere)
+		CLR	PiscadaAtiva
+		MOV	Posicao, R1
+		MOV	TeclaNoCursor, (R1) 	;move a tecla
+		JMP	FimPiscar	
+NotPisca1:	MOV	#1, PiscadaAtiva
+		MOV	Posicao, R1
+		MOV	#'_', (R1)		;move o underline 
+		JMP	FimPiscar
+
+FimPiscar: 	RTS	R7
+
+
+;**************************************************************************************************
+; Variaveis do programa
+; Ocupam a memória logo após o final do programa		
+
+Teclado:	dw		0		; Armazena a tecla a ser colocada no visor
+Cursor:		dw		0		; Variavel para o cursor
+Posicao:	dw		0		; Endereço no visor da posição atual do cursor
+KbhitAtiva:	dw		0		; Indica se esta em modo edicao de texto (esperando tecla)
+GetCharAtivo:   dw		0		; Quando esta variável esta em 1, esta em execução a função getchar	
+PosNoVisor:	dw		0		; Contador auxiliar para saber em que posicao ja estou no visor (quantas teclas ja coloquei)
+TeclaNoCursor:	dw		0		; Variavel que guarda a tecla que esta na popsicao atual
+AndandoRel0:	dw		0		; Se está com valor 1, relogio está andando, em 0 está parado 
+AndandoRel1:	dw		0		; Se está com valor 1, relogio está andando, em 0 está parado 
+ContTimer:	dw		0		; Contador auxiliar interrupçoes de timer
+ContPiscadas:	dw		0		; Contador auxiliar para piscar o cursor 
+PiscadaAtiva:	dw		0		; Variavel auxiliar para mudar o que se tinha antes (pisca)
+ContSegTotal0:	dw		0		; Contador do numero total de segundos do relogio 0
+ContSegTotal1:  dw		0		; Contador do numero total de segundos do relogio 1
+ContIntTotal0:	dw		0		; Contador de interrupçoes 0
+ContIntTotal1:	dw		0		; Contador de interrupçoes 1
+ContUSeg0:	dw		0		; Contador de interrupcoes unidade de segundos
+ContDSeg0:	dw		0		; Contador de interrupcoes dezena de segundos
+ContUMin0:	dw		0		; Contador de interrupcoes unidade de minutos
+ContDMin0:	dw		0		; Contador de interrupcoes dezena de minutos
+ContUSeg1:	dw		0		; Contador de interrupcoes unidade de segundos
+ContDSeg1:	dw		0		; Contador de interrupcoes dezena de segundos
+ContUMin1:	dw		0		; Contador de interrupcoes unidade de minutos
+ContDMin1:	dw		0		; Contador de interrupcoes dezena de minutos
+PrintaRel0:	dw		0		; Printa em 1 = visivel, printa em 0 = invisivel
+PrintaRel1:	dw		0		; Printa em 1 = visivel, printa em 0 = invisivel
+PosRel00:	dw		0		; Relogio0 = PosRel03 PosRel02 : PosRel01 PosRel00
+PosRel01:	dw		0
+PosRel02:	dw		0
+PosRel03:	dw		0
+PosRel10:	dw		0		; Relogio1 = PosRel13 PosRel12 : PosRel11 PosRel10
+PosRel11:	dw		0
+PosRel12:	dw		0
+PosRel13:	dw		0
